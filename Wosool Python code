@@ -1,0 +1,262 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime
+
+app = FastAPI(
+    title="Disability Parking – Absher/Basher Linking Service",
+    description=(
+        "Prototype API that links a disability parking card to a citizen's national ID "
+        "and a specific vehicle plate (using Absher data), so that Basher (used by police/security) "
+        "can verify plates in the field."
+    ),
+    version="1.0.0"
+)
+
+# ============================================================
+# 1) Simulated ABSHER system
+#    - Absher has all person info and their registered vehicles.
+# ============================================================
+
+class AbsherVehicle(BaseModel):
+    plate_number: str
+    national_id_of_owner: str
+
+
+class AbsherUser(BaseModel):
+    national_id: str
+    full_name: str
+    vehicles: List[AbsherVehicle]
+
+
+# Fake Absher data
+ABSHER_USERS_DB: List[AbsherUser] = [
+    AbsherUser(
+        national_id="1234567890",
+        full_name="Example User",
+        vehicles=[
+            AbsherVehicle(plate_number="ABC1234", national_id_of_owner="1234567890"),
+            AbsherVehicle(plate_number="XYZ9999", national_id_of_owner="1234567890"),
+        ],
+    )
+]
+
+
+class AbsherClient:
+    """
+    Simulated Absher client.
+    In real life this would call Absher APIs to get person + vehicle data.
+    """
+
+    @staticmethod
+    def get_user_by_national_id(national_id: str) -> Optional[AbsherUser]:
+        for user in ABSHER_USERS_DB:
+            if user.national_id == national_id:
+                return user
+        return None
+
+    @staticmethod
+    def user_owns_vehicle(national_id: str, plate_number: str) -> bool:
+        user = AbsherClient.get_user_by_national_id(national_id)
+        if not user:
+            return False
+        return any(v.plate_number == plate_number for v in user.vehicles)
+
+
+# ============================================================
+# 2) Simulated Disability Card Registry
+# ============================================================
+
+class DisabilityCard(BaseModel):
+    card_number: str
+    national_id_of_holder: str
+    status: str  # "ACTIVE" or "EXPIRED"
+
+
+# Fake disability card data
+DISABILITY_CARDS_DB: List[DisabilityCard] = [
+    DisabilityCard(card_number="CARD-001", national_id_of_holder="1234567890", status="ACTIVE"),
+    DisabilityCard(card_number="CARD-002", national_id_of_holder="1234567890", status="EXPIRED"),
+]
+
+
+class DisabilityRegistryClient:
+    """
+    Simulated Disability Card Registry client.
+    In real life this would call the official disability card system.
+    """
+
+    @staticmethod
+    def get_card_by_number(card_number: str) -> Optional[DisabilityCard]:
+        for card in DISABILITY_CARDS_DB:
+            if card.card_number == card_number:
+                return card
+        return None
+
+
+# ============================================================
+# 3) Our DIGITAL LINK database
+#    This is where we store: card ↔ national_id ↔ plate
+# ============================================================
+
+class DisabilityLink(BaseModel):
+    card_number: str
+    national_id: str
+    plate_number: str
+    created_at: datetime
+
+
+# This is the digital link table (in-memory for now).
+LINKS_DB: List[DisabilityLink] = []
+
+
+# ============================================================
+# 4) Request / Response Models
+# ============================================================
+
+class CreateLinkRequest(BaseModel):
+    """
+    Request to create a digital link between:
+    - national_id (Absher user)
+    - card_number (disability card)
+    - plate_number (vehicle registered in Absher)
+    """
+    national_id: str
+    card_number: str
+    plate_number: str
+
+
+class CheckPlateResponse(BaseModel):
+    """
+    Response for Basher (police/security app) when checking a plate.
+    """
+    plate_number: str
+    has_valid_disability_link: bool
+    card_number: Optional[str] = None
+    national_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class LinksByNationalIdResponse(BaseModel):
+    """
+    Shows all disability links for one Absher user.
+    """
+    national_id: str
+    links: List[DisabilityLink]
+
+
+# ============================================================
+# 5) Endpoints
+# ============================================================
+
+# -----------------------------
+# ABSHER side (citizen / backoffice)
+# -----------------------------
+
+@app.post("/absher/link-disability-card", response_model=DisabilityLink)
+def absher_link_disability_card(body: CreateLinkRequest):
+    """
+    ABSHER FLOW:
+    This endpoint is used on the Absher side (citizen or backoffice).
+
+    It will:
+    1. Check that the disability card exists, belongs to this national ID, and is ACTIVE.
+    2. Check in Absher that this plate_number belongs to this national ID.
+    3. If both are valid, create a DIGITAL LINK:
+       disability_card ↔ national_id ↔ vehicle_plate
+    """
+
+    # 1) Check disability card in Disability Registry
+    card = DisabilityRegistryClient.get_card_by_number(body.card_number)
+    if not card:
+        raise HTTPException(status_code=404, detail="Disability card not found")
+
+    if card.national_id_of_holder != body.national_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Disability card does not belong to this national ID"
+        )
+
+    if card.status != "ACTIVE":
+        raise HTTPException(
+            status_code=400,
+            detail="Disability card is not active"
+        )
+
+    # 2) Check vehicle ownership in Absher
+    if not AbsherClient.user_owns_vehicle(body.national_id, body.plate_number):
+        raise HTTPException(
+            status_code=400,
+            detail="This plate is not registered to this national ID in Absher"
+        )
+
+    # 3) Optional: check if link already exists
+    for link in LINKS_DB:
+        if (
+            link.card_number == body.card_number
+            and link.plate_number == body.plate_number
+            and link.national_id == body.national_id
+        ):
+            # Return existing link
+            return link
+
+    # 4) Create new digital link
+    new_link = DisabilityLink(
+        card_number=body.card_number,
+        national_id=body.national_id,
+        plate_number=body.plate_number,
+        created_at=datetime.utcnow()
+    )
+    LINKS_DB.append(new_link)
+    return new_link
+
+
+@app.get("/absher/links-by-id", response_model=LinksByNationalIdResponse)
+def absher_get_links_by_national_id(national_id: str):
+    """
+    ABSHER FLOW:
+    Show all disability links (cards ↔ plates) for one Absher user.
+    """
+    user_links = [l for l in LINKS_DB if l.national_id == national_id]
+    return LinksByNationalIdResponse(national_id=national_id, links=user_links)
+
+
+# -----------------------------
+# BASHER side (police / security app)
+# -----------------------------
+
+@app.get("/basher/check-plate", response_model=CheckPlateResponse)
+def basher_check_plate(plate_number: str):
+    """
+    BASHER FLOW:
+    This endpoint is used by Basher (police/security app).
+
+    - Security enters or scans a plate number in Basher.
+    - Basher calls this API.
+    - We check if there is a DIGITAL LINK with an ACTIVE disability card.
+    - If yes, we return:
+        has_valid_disability_link = True
+        plus card_number and national_id (from Absher).
+    """
+
+    for link in LINKS_DB:
+        if link.plate_number == plate_number:
+            # Ensure the related disability card is still ACTIVE
+            card = DisabilityRegistryClient.get_card_by_number(link.card_number)
+            if card and card.status == "ACTIVE":
+                return CheckPlateResponse(
+                    plate_number=plate_number,
+                    has_valid_disability_link=True,
+                    card_number=link.card_number,
+                    national_id=link.national_id,
+                    created_at=link.created_at
+                )
+
+    # No valid link found
+    return CheckPlateResponse(
+        plate_number=plate_number,
+        has_valid_disability_link=False,
+        card_number=None,
+        national_id=None,
+        created_at=None
+    )

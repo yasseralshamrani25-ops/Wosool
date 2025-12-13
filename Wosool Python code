@@ -4,11 +4,11 @@ from typing import List, Optional
 from datetime import datetime
 
 app = FastAPI(
-    title="Disability Parking – Absher/Basher Linking Service",
+    title="Disability Parking – Absher + ANPR Linking Service",
     description=(
         "Prototype API that links a disability parking card to a citizen's national ID "
-        "and a specific vehicle plate (using Absher data), so that Basher (used by police/security) "
-        "can verify plates in the field."
+        "and a specific vehicle plate (using Absher data), so that an ANPR camera in a parking lot "
+        "can verify plates automatically in real time."
     ),
     version="1.0.0"
 )
@@ -126,9 +126,9 @@ class CreateLinkRequest(BaseModel):
     plate_number: str
 
 
-class CheckPlateResponse(BaseModel):
+class ANPRCheckPlateResponse(BaseModel):
     """
-    Response for Basher (police/security app) when checking a plate.
+    Response for an ANPR camera system when checking a plate.
     """
     plate_number: str
     has_valid_disability_link: bool
@@ -157,13 +157,12 @@ class LinksByNationalIdResponse(BaseModel):
 def absher_link_disability_card(body: CreateLinkRequest):
     """
     ABSHER FLOW:
-    This endpoint is used on the Absher side (citizen or backoffice).
+    Citizen (or guardian) links an ACTIVE disability card to a specific vehicle plate.
 
-    It will:
-    1. Check that the disability card exists, belongs to this national ID, and is ACTIVE.
-    2. Check in Absher that this plate_number belongs to this national ID.
-    3. If both are valid, create a DIGITAL LINK:
-       disability_card ↔ national_id ↔ vehicle_plate
+    Validations:
+    1) Disability card exists, belongs to the national ID, and is ACTIVE.
+    2) Plate belongs to that national ID in Absher.
+    3) Store a digital link: disability_card ↔ national_id ↔ vehicle_plate
     """
 
     # 1) Check disability card in Disability Registry
@@ -172,32 +171,18 @@ def absher_link_disability_card(body: CreateLinkRequest):
         raise HTTPException(status_code=404, detail="Disability card not found")
 
     if card.national_id_of_holder != body.national_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Disability card does not belong to this national ID"
-        )
+        raise HTTPException(status_code=400, detail="Disability card does not belong to this national ID")
 
     if card.status != "ACTIVE":
-        raise HTTPException(
-            status_code=400,
-            detail="Disability card is not active"
-        )
+        raise HTTPException(status_code=400, detail="Disability card is not active")
 
     # 2) Check vehicle ownership in Absher
     if not AbsherClient.user_owns_vehicle(body.national_id, body.plate_number):
-        raise HTTPException(
-            status_code=400,
-            detail="This plate is not registered to this national ID in Absher"
-        )
+        raise HTTPException(status_code=400, detail="This plate is not registered to this national ID in Absher")
 
     # 3) Optional: check if link already exists
     for link in LINKS_DB:
-        if (
-            link.card_number == body.card_number
-            and link.plate_number == body.plate_number
-            and link.national_id == body.national_id
-        ):
-            # Return existing link
+        if link.card_number == body.card_number and link.plate_number == body.plate_number and link.national_id == body.national_id:
             return link
 
     # 4) Create new digital link
@@ -222,21 +207,22 @@ def absher_get_links_by_national_id(national_id: str):
 
 
 # -----------------------------
-# BASHER side (police / security app)
+# ANPR side (parking lot camera system)
 # -----------------------------
 
-@app.get("/basher/check-plate", response_model=CheckPlateResponse)
-def basher_check_plate(plate_number: str):
+@app.get("/anpr/check-plate", response_model=ANPRCheckPlateResponse)
+def anpr_check_plate(plate_number: str):
     """
-    BASHER FLOW:
-    This endpoint is used by Basher (police/security app).
+    ANPR FLOW:
+    This endpoint is called by an ANPR camera system in a parking lot.
 
-    - Security enters or scans a plate number in Basher.
-    - Basher calls this API.
-    - We check if there is a DIGITAL LINK with an ACTIVE disability card.
-    - If yes, we return:
-        has_valid_disability_link = True
-        plus card_number and national_id (from Absher).
+    - Camera reads plate_number automatically.
+    - Parking system calls this API in real time.
+    - API checks if there is a DIGITAL LINK with an ACTIVE disability card.
+    - Response can be used to:
+        • allow/deny access to disabled parking spot
+        • trigger alert if misuse is detected
+        • log statistics for city/parking management
     """
 
     for link in LINKS_DB:
@@ -244,7 +230,7 @@ def basher_check_plate(plate_number: str):
             # Ensure the related disability card is still ACTIVE
             card = DisabilityRegistryClient.get_card_by_number(link.card_number)
             if card and card.status == "ACTIVE":
-                return CheckPlateResponse(
+                return ANPRCheckPlateResponse(
                     plate_number=plate_number,
                     has_valid_disability_link=True,
                     card_number=link.card_number,
@@ -252,8 +238,7 @@ def basher_check_plate(plate_number: str):
                     created_at=link.created_at
                 )
 
-    # No valid link found
-    return CheckPlateResponse(
+    return ANPRCheckPlateResponse(
         plate_number=plate_number,
         has_valid_disability_link=False,
         card_number=None,
